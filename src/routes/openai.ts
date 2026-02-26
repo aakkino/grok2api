@@ -1303,6 +1303,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             settings: settingsBundle.grok,
             global: settingsBundle.global,
             origin,
+            requestedModel,
             onFinish: async ({ status, duration }) => {
               await addRequestLog(c.env.DB, {
                 ip,
