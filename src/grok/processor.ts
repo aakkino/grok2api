@@ -156,7 +156,30 @@ function renderTagToCitation(tag: string, state: CitationState): string {
 
 function replaceInlineCitations(text: string, state: CitationState): string {
   if (!text) return text;
-  return text.replace(/<grok:render\b[^>]*>[\s\S]*?<\/grok:render>/g, (tag) => renderTagToCitation(tag, state));
+  const re = /<grok:render\b[^>]*>[\s\S]*?<\/grok:render>/g;
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out += text.slice(last, m.index);
+    const citation = renderTagToCitation(m[0] ?? "", state);
+    out += separateCitationFromUrl(out, citation);
+    last = re.lastIndex;
+  }
+  out += text.slice(last);
+  return out;
+}
+
+function looksLikeUrlSuffix(prefix: string): boolean {
+  if (!prefix) return false;
+  const tail = prefix.slice(-2048);
+  return /(?:https?:\/\/|www\.)[^\s<>"'`]+$/i.test(tail);
+}
+
+function separateCitationFromUrl(prefix: string, citation: string): string {
+  if (!citation || !citation.startsWith("[")) return citation;
+  if (looksLikeUrlSuffix(prefix)) return ` ${citation}`;
+  return citation;
 }
 
 function consumeInlineCitationToken(token: string, state: CitationState): string {
@@ -184,7 +207,8 @@ function consumeInlineCitationToken(token: string, state: CitationState): string
 
     const fullEnd = end + GROK_RENDER_END_LEN;
     const tag = text.slice(start, fullEnd);
-    out += renderTagToCitation(tag, state);
+    const citation = renderTagToCitation(tag, state);
+    out += separateCitationFromUrl(out, citation);
     cursor = fullEnd;
   }
 

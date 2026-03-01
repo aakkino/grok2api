@@ -18,6 +18,7 @@ ASSET_URL = "https://assets.grok.com/"
 _GROK_RENDER_END = "</grok:render>"
 _GROK_RENDER_TAG_RE = re.compile(r"<grok:render\b(?P<attrs>[^>]*)>(?P<body>.*?)</grok:render>", re.DOTALL)
 _GROK_ATTR_RE = re.compile(r'([A-Za-z_:][A-Za-z0-9_:\.\-]*)\s*=\s*("([^"]*)"|\'([^\']*)\')')
+_URL_TRAILING_RE = re.compile(r"(?:https?://|www\.)[^\s<>'\"`]+$", re.IGNORECASE)
 
 
 def _build_video_poster_preview(video_url: str, thumbnail_url: str = "") -> str:
@@ -135,10 +136,30 @@ class BaseProcessor:
         local_map = citation_map if citation_map is not None else {}
         local_next = next_index_holder if next_index_holder is not None else [1]
 
-        def _repl(m: re.Match[str]) -> str:
-            return self._render_tag_to_citation(m.group(0), local_map, local_next)
+        out: list[str] = []
+        last = 0
+        for m in _GROK_RENDER_TAG_RE.finditer(text):
+            out.append(text[last:m.start()])
+            repl = self._render_tag_to_citation(m.group(0), local_map, local_next)
+            prefix = "".join(out)
+            out.append(self._separate_citation_from_url(prefix, repl))
+            last = m.end()
+        out.append(text[last:])
+        return "".join(out)
 
-        return _GROK_RENDER_TAG_RE.sub(_repl, text)
+    @staticmethod
+    def _looks_like_url_suffix(prefix: str) -> bool:
+        if not prefix:
+            return False
+        tail = prefix[-2048:]
+        return bool(_URL_TRAILING_RE.search(tail))
+
+    def _separate_citation_from_url(self, prefix: str, citation: str) -> str:
+        if not citation or not citation.startswith("["):
+            return citation
+        if self._looks_like_url_suffix(prefix):
+            return f" {citation}"
+        return citation
             
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
@@ -213,7 +234,9 @@ class StreamProcessor(BaseProcessor):
 
             end += len(_GROK_RENDER_END)
             tag = text[start:end]
-            out.append(self._render_tag_to_citation(tag, self._citation_map, self._citation_next))
+            citation = self._render_tag_to_citation(tag, self._citation_map, self._citation_next)
+            prefix = "".join(out)
+            out.append(self._separate_citation_from_url(prefix, citation))
             cursor = end
 
         return "".join(out)
