@@ -114,6 +114,83 @@ function normalizeGeneratedAssetUrls(input: unknown): string[] {
   return out;
 }
 
+const GROK_RENDER_START = "<grok:render";
+const GROK_RENDER_END = "</grok:render>";
+const GROK_RENDER_END_LEN = GROK_RENDER_END.length;
+
+type CitationState = {
+  map: Map<string, number>;
+  next: number;
+  pending: string;
+};
+
+function parseTagAttrs(attrText: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const re = /([A-Za-z_:][A-Za-z0-9_:\.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrText)) !== null) {
+    const key = (m[1] ?? "").trim();
+    const value = (m[2] ?? m[3] ?? "").trim();
+    if (key) out[key] = value;
+  }
+  return out;
+}
+
+function renderTagToCitation(tag: string, state: CitationState): string {
+  const m = tag.match(/^<grok:render\b([^>]*)>([\s\S]*?)<\/grok:render>$/);
+  if (!m) return tag;
+
+  const attrs = parseTagAttrs(m[1] ?? "");
+  if (attrs.card_type !== "citation_card") return tag;
+  if (attrs.type !== "render_inline_citation") return tag;
+
+  const body = (m[2] ?? "").trim();
+  const key = (attrs.card_id ?? "").trim() || body || `inline-${state.next}`;
+  const hit = state.map.get(key);
+  if (hit) return `[${hit}]`;
+
+  const idx = state.next++;
+  state.map.set(key, idx);
+  return `[${idx}]`;
+}
+
+function replaceInlineCitations(text: string, state: CitationState): string {
+  if (!text) return text;
+  return text.replace(/<grok:render\b[^>]*>[\s\S]*?<\/grok:render>/g, (tag) => renderTagToCitation(tag, state));
+}
+
+function consumeInlineCitationToken(token: string, state: CitationState): string {
+  if (!token) return token;
+
+  const text = state.pending ? `${state.pending}${token}` : token;
+  state.pending = "";
+
+  let out = "";
+  let cursor = 0;
+
+  while (true) {
+    const start = text.indexOf(GROK_RENDER_START, cursor);
+    if (start < 0) {
+      out += text.slice(cursor);
+      break;
+    }
+
+    out += text.slice(cursor, start);
+    const end = text.indexOf(GROK_RENDER_END, start);
+    if (end < 0) {
+      state.pending = text.slice(start);
+      break;
+    }
+
+    const fullEnd = end + GROK_RENDER_END_LEN;
+    const tag = text.slice(start, fullEnd);
+    out += renderTagToCitation(tag, state);
+    cursor = fullEnd;
+  }
+
+  return out;
+}
+
 export function createOpenAiStreamFromGrokNdjson(
   grokResp: Response,
   opts: {
@@ -139,8 +216,9 @@ export function createOpenAiStreamFromGrokNdjson(
   const filteredTags = (settings.filtered_tags ?? "")
     .split(",")
     .map((t) => t.trim())
-    .filter(Boolean);
+    .filter((t) => Boolean(t) && t !== "grok:render");
   const showThinking = settings.show_thinking !== false;
+  const citationState: CitationState = { map: new Map<string, number>(), next: 1, pending: "" };
 
   const firstTimeoutMs = Math.max(0, (settings.stream_first_response_timeout ?? 30) * 1000);
   const chunkTimeoutMs = Math.max(0, (settings.stream_chunk_timeout ?? 120) * 1000);
@@ -335,7 +413,8 @@ export function createOpenAiStreamFromGrokNdjson(
             // Text chat stream
             if (Array.isArray(rawToken)) continue;
             if (typeof rawToken !== "string" || !rawToken) continue;
-            let token = rawToken;
+            let token = consumeInlineCitationToken(rawToken, citationState);
+            if (!token) continue;
 
             if (filteredTags.some((t) => token.includes(t))) continue;
 
@@ -382,6 +461,14 @@ export function createOpenAiStreamFromGrokNdjson(
           }
         }
 
+        if (citationState.pending) {
+          const pending = replaceInlineCitations(citationState.pending, citationState);
+          if (pending && !filteredTags.some((t) => pending.includes(t))) {
+            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, pending)));
+          }
+          citationState.pending = "";
+        }
+
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
@@ -417,6 +504,7 @@ export async function parseOpenAiFromGrokNdjson(
 
   let content = "";
   let model = requestedModel;
+  const citationState: CitationState = { map: new Map<string, number>(), next: 1, pending: "" };
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -456,7 +544,9 @@ export async function parseOpenAiFromGrokNdjson(
     if (typeof modelResp.error === "string" && modelResp.error) throw new Error(modelResp.error);
 
     if (typeof modelResp.model === "string" && modelResp.model) model = modelResp.model;
-    if (typeof modelResp.message === "string") content = modelResp.message;
+    if (typeof modelResp.message === "string") {
+      content = replaceInlineCitations(modelResp.message, citationState);
+    }
 
     const rawUrls = modelResp.generatedImageUrls;
     const urls = normalizeGeneratedAssetUrls(rawUrls);

@@ -5,6 +5,7 @@ import time
 import uuid
 import random
 import html
+import re
 import orjson
 from typing import Any, AsyncGenerator, Optional, AsyncIterable, List
 
@@ -14,6 +15,9 @@ from app.services.grok.assets import DownloadService
 
 
 ASSET_URL = "https://assets.grok.com/"
+_GROK_RENDER_END = "</grok:render>"
+_GROK_RENDER_TAG_RE = re.compile(r"<grok:render\b(?P<attrs>[^>]*)>(?P<body>.*?)</grok:render>", re.DOTALL)
+_GROK_ATTR_RE = re.compile(r'([A-Za-z_:][A-Za-z0-9_:\.\-]*)\s*=\s*("([^"]*)"|\'([^\']*)\')')
 
 
 def _build_video_poster_preview(video_url: str, thumbnail_url: str = "") -> str:
@@ -81,6 +85,60 @@ class BaseProcessor:
         if self.app_url:
             return f"{self.app_url.rstrip('/')}{local_path}"
         return local_path
+
+    @staticmethod
+    def _parse_attrs(attr_text: str) -> dict[str, str]:
+        attrs: dict[str, str] = {}
+        for m in _GROK_ATTR_RE.finditer(attr_text or ""):
+            key = (m.group(1) or "").strip()
+            val = m.group(3) if m.group(3) is not None else (m.group(4) or "")
+            if key:
+                attrs[key] = val
+        return attrs
+
+    def _render_tag_to_citation(
+        self,
+        tag: str,
+        citation_map: dict[str, int],
+        next_index_holder: list[int],
+    ) -> str:
+        m = _GROK_RENDER_TAG_RE.fullmatch(tag.strip())
+        if not m:
+            return tag
+
+        attrs = self._parse_attrs(m.group("attrs") or "")
+        if attrs.get("card_type") != "citation_card":
+            return tag
+        if attrs.get("type") != "render_inline_citation":
+            return tag
+
+        body = (m.group("body") or "").strip()
+        key = attrs.get("card_id") or body or f"inline-{next_index_holder[0]}"
+
+        idx = citation_map.get(key)
+        if idx is None:
+            idx = next_index_holder[0]
+            citation_map[key] = idx
+            next_index_holder[0] += 1
+
+        return f"[{idx}]"
+
+    def _replace_inline_citations(
+        self,
+        text: str,
+        citation_map: Optional[dict[str, int]] = None,
+        next_index_holder: Optional[list[int]] = None,
+    ) -> str:
+        if not text:
+            return text
+
+        local_map = citation_map if citation_map is not None else {}
+        local_next = next_index_holder if next_index_holder is not None else [1]
+
+        def _repl(m: re.Match[str]) -> str:
+            return self._render_tag_to_citation(m.group(0), local_map, local_next)
+
+        return _GROK_RENDER_TAG_RE.sub(_repl, text)
             
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
@@ -116,13 +174,49 @@ class StreamProcessor(BaseProcessor):
         self.fingerprint: str = ""
         self.think_opened: bool = False
         self.role_sent: bool = False
-        self.filter_tags = get_config("grok.filter_tags", [])
+        all_filter_tags = get_config("grok.filter_tags", [])
+        if isinstance(all_filter_tags, str):
+            all_filter_tags = [x.strip() for x in all_filter_tags.split(",") if x.strip()]
+        if not isinstance(all_filter_tags, list):
+            all_filter_tags = []
+        self.filter_tags = [str(t) for t in all_filter_tags if str(t) and str(t) != "grok:render"]
         self.image_format = get_config("app.image_format", "url")
+        self._render_pending: str = ""
+        self._citation_map: dict[str, int] = {}
+        self._citation_next: list[int] = [1]
         
         if think is None:
             self.show_think = get_config("grok.thinking", False)
         else:
             self.show_think = think
+
+    def _consume_token_with_citations(self, token: str) -> str:
+        if not token:
+            return token
+
+        text = f"{self._render_pending}{token}" if self._render_pending else token
+        self._render_pending = ""
+
+        out: list[str] = []
+        cursor = 0
+        while True:
+            start = text.find("<grok:render", cursor)
+            if start < 0:
+                out.append(text[cursor:])
+                break
+
+            out.append(text[cursor:start])
+            end = text.find(_GROK_RENDER_END, start)
+            if end < 0:
+                self._render_pending = text[start:]
+                break
+
+            end += len(_GROK_RENDER_END)
+            tag = text[start:end]
+            out.append(self._render_tag_to_citation(tag, self._citation_map, self._citation_next))
+            cursor = end
+
+        return "".join(out)
     
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
@@ -190,9 +284,21 @@ class StreamProcessor(BaseProcessor):
                 
                 # 普通 token
                 if (token := resp.get("token")) is not None:
+                    if isinstance(token, str):
+                        token = self._consume_token_with_citations(token)
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
                         yield self._sse(token)
                         
+            if self._render_pending:
+                pending = self._replace_inline_citations(
+                    self._render_pending,
+                    citation_map=self._citation_map,
+                    next_index_holder=self._citation_next,
+                )
+                if pending and not (self.filter_tags and any(t in pending for t in self.filter_tags)):
+                    yield self._sse(pending)
+                self._render_pending = ""
+
             if self.think_opened:
                 yield self._sse("</think>\n")
             yield self._sse(finish="stop")
@@ -210,6 +316,12 @@ class CollectProcessor(BaseProcessor):
     def __init__(self, model: str, token: str = ""):
         super().__init__(model, token)
         self.image_format = get_config("app.image_format", "url")
+        all_filter_tags = get_config("grok.filter_tags", [])
+        if isinstance(all_filter_tags, str):
+            all_filter_tags = [x.strip() for x in all_filter_tags.split(",") if x.strip()]
+        if not isinstance(all_filter_tags, list):
+            all_filter_tags = []
+        self.filter_tags = [str(t) for t in all_filter_tags if str(t) and str(t) != "grok:render"]
     
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集完整响应"""
@@ -234,6 +346,12 @@ class CollectProcessor(BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     response_id = mr.get("responseId", "")
                     content = mr.get("message", "")
+                    if isinstance(content, str):
+                        content = self._replace_inline_citations(content)
+                        if self.filter_tags:
+                            for t in self.filter_tags:
+                                if t:
+                                    content = content.replace(t, "")
                     
                     if urls := mr.get("generatedImageUrls"):
                         content += "\n"
