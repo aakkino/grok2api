@@ -243,6 +243,8 @@ class StreamProcessor(BaseProcessor):
     
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
+        is_reasoning = False
+        reasoning_finished = False
         try:
             async for line in response:
                 if not line:
@@ -310,7 +312,34 @@ class StreamProcessor(BaseProcessor):
                     if isinstance(token, str):
                         token = self._consume_token_with_citations(token)
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
-                        yield self._sse(token)
+                        current_is_reasoning = bool(resp.get("isThinking"))
+                        message_tag = resp.get("messageTag")
+
+                        # Some upstream frames may continue to emit stale reasoning tokens
+                        # after reasoning is closed; ignore those to keep stream coherent.
+                        if reasoning_finished and current_is_reasoning:
+                            continue
+
+                        content = token
+                        if message_tag == "header":
+                            content = f"\n\n{token}\n\n"
+
+                        skip = False
+                        if not is_reasoning and current_is_reasoning:
+                            if self.show_think:
+                                content = f"<think>\n{content}"
+                            else:
+                                skip = True
+                        elif is_reasoning and not current_is_reasoning:
+                            if self.show_think:
+                                content = f"\n</think>\n{content}"
+                            reasoning_finished = True
+                        elif current_is_reasoning and not self.show_think:
+                            skip = True
+
+                        if not skip:
+                            yield self._sse(content)
+                        is_reasoning = current_is_reasoning
                         
             if self._render_pending:
                 pending = self._replace_inline_citations(
@@ -321,6 +350,9 @@ class StreamProcessor(BaseProcessor):
                 if pending and not (self.filter_tags and any(t in pending for t in self.filter_tags)):
                     yield self._sse(pending)
                 self._render_pending = ""
+
+            if is_reasoning and self.show_think:
+                yield self._sse("\n</think>\n")
 
             if self.think_opened:
                 yield self._sse("</think>\n")

@@ -236,7 +236,8 @@ class ChatRequestBuilder:
             "toolOverrides": {},
             "enableSideBySide": True,
             "sendFinalMetadata": True,
-            "isReasoning": False,
+            # Honor per-request thinking flag so upstream can emit reasoning stream.
+            "isReasoning": bool(think),
             "disableTextFollowUps": False,
             "responseMetadata": {
                 "modelConfigOverride": {"modelMap": {}},
